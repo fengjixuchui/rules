@@ -17,7 +17,7 @@
 
 # Starting with version 8, the Falco engine supports exceptions.
 # However the Falco rules file does not use them by default.
-- required_engine_version: 16
+- required_engine_version: 17
 
 # Currently disabled as read/write are ignored syscalls. The nearly
 # similar open_write/open_read check for files being opened for
@@ -74,6 +74,11 @@
 - macro: modify
   condition: (rename or remove)
 
+# %evt.arg.flags available for evt.dir=>, but only for umount2
+# %evt.arg.name is path and available for evt.dir=<
+# - macro: umount
+#   condition: (evt.type in (umount, umount2))
+
 - macro: spawned_process
   condition: (evt.type in (execve, execveat) and evt.dir=<)
 
@@ -85,6 +90,9 @@
 
 - macro: chmod
   condition: (evt.type in (chmod, fchmod, fchmodat) and evt.dir=<)
+
+- macro: kernel_module_load
+  condition: (evt.type in (init_module, finit_module) and evt.dir=<)
 
 # File categories
 - macro: bin_dir
@@ -181,9 +189,6 @@
 - list: sysdigcloud_binaries
   items: [setup-backend, dragent, sdchecks]
 
-- list: docker_binaries
-  items: [docker, dockerd, exe, docker-compose, docker-entrypoi, docker-runc-cur, docker-current, dockerd-current]
-
 - list: k8s_binaries
   items: [hyperkube, skydns, kube2sky, exechealthz, weave-net, loopback, bridge, openshift-sdn, openshift]
 
@@ -218,7 +223,7 @@
 # The explicit quotes are needed to avoid the - characters being
 # interpreted by the filter expression.
 - list: rpm_binaries
-  items: [dnf, rpm, rpmkey, yum, '"75-system-updat"', rhsmcertd-worke, rhsmcertd, subscription-ma,
+  items: [dnf, dnf-automatic, rpm, rpmkey, yum, '"75-system-updat"', rhsmcertd-worke, rhsmcertd, subscription-ma,
           repoquery, rpmkeys, rpmq, yum-cron, yum-config-mana, yum-debug-dump,
           abrt-action-sav, rpmdb_stat, microdnf, rhn_check, yumdb]
 
@@ -324,7 +329,7 @@
 # Network
 - macro: inbound
   condition: >
-    (((evt.type in (accept,listen) and evt.dir=<) or
+    (((evt.type in (accept,accept4,listen) and evt.dir=<) or
       (evt.type in (recvfrom,recvmsg) and evt.dir=< and
        fd.l4proto != tcp and fd.connected=false and fd.name_changed=true)) and
      (fd.typechar = 4 or fd.typechar = 6) and
@@ -348,7 +353,7 @@
 # for efficiency.
 - macro: inbound_outbound
   condition: >
-    ((((evt.type in (accept,listen,connect) and evt.dir=<)) and
+    ((((evt.type in (accept,accept4,listen,connect) and evt.dir=<)) and
      (fd.typechar = 4 or fd.typechar = 6)) and
      (fd.ip != "0.0.0.0" and fd.net != "127.0.0.0/8") and
      (evt.rawres >= 0 or evt.res = EINPROGRESS))
@@ -2974,7 +2979,7 @@
 
 - rule: Packet socket created in container
   desc: Detect new packet socket at the device driver (OSI Layer 2) level in a container. Packet socket could be used for ARP Spoofing and privilege escalation(CVE-2020-14386) by attacker.
-  condition: evt.type=socket and evt.arg[0]=AF_PACKET and container and not proc.name in (user_known_packet_socket_binaries)
+  condition: evt.type=socket and evt.arg[0] contains AF_PACKET and container and not proc.name in (user_known_packet_socket_binaries)
   output: Packet socket was created in a container (user=%user.name user_loginuid=%user.loginuid command=%proc.cmdline pid=%proc.pid socket_info=%evt.args container_id=%container.id container_name=%container.name image=%container.image.repository:%container.image.tag)
   priority: NOTICE
   tags: [container, network, mitre_discovery, T1046]
@@ -3015,6 +3020,9 @@
 - list: allowed_image
   items: [] # add image to monitor, i.e.: bitnami/nginx
 
+- list: authorized_server_binary
+  items: []  # add binary to allow, i.e.: nginx
+  
 - list: authorized_server_port
   items: [] # add port to allow, i.e.: 80
 
@@ -3147,13 +3155,19 @@
   enabled: false
   tags: [host, container, network, mitre_command_and_control, TA0011]
 
-- list: white_listed_modules
+- list: allowed_container_images_loading_kernel_module
   items: []
 
+# init_module and finit_module syscalls are available since Falco 0.35.0
+# rule coverage now extends to modprobe usage via init_module logging
+# and previous alerting on spawned_process and insmod is now covered
+# by finit_module syscall
 - rule: Linux Kernel Module Injection Detected
   desc: Detect kernel module was injected (from container).
-  condition: spawned_process and container and proc.name=insmod and not proc.args in (white_listed_modules) and thread.cap_effective icontains sys_module
-  output: Linux Kernel Module injection using insmod detected (user=%user.name user_loginuid=%user.loginuid parent_process=%proc.pname module=%proc.args %container.info image=%container.image.repository:%container.image.tag)
+  condition: kernel_module_load and container
+    and not container.image.repository in (allowed_container_images_loading_kernel_module)
+    and thread.cap_effective icontains sys_module
+  output: Linux Kernel Module injection from container detected (user=%user.name uid=%user.uid user_loginuid=%user.loginuid process_name=%proc.name parent_process_name=%proc.pname parent_exepath=%proc.pexepath %proc.aname[2] %proc.aexepath[2] module=%proc.args %container.info image=%container.image.repository:%container.image.tag res=%evt.res syscall=%evt.type)
   priority: WARNING
   tags: [host, container, process, mitre_execution, mitre_persistence, TA0002]
 
@@ -3297,7 +3311,7 @@
   tags: [host, container, process, mitre_initial_access, T1190]
 
 - list: docker_binaries
-  items: [dockerd, containerd-shim, "runc:[1:CHILD]", pause]
+  items: [docker, dockerd, containerd-shim, "runc:[1:CHILD]", pause, exe, docker-compose, docker-entrypoi, docker-runc-cur, docker-current, dockerd-current]
 
 - macro: docker_procs
   condition: proc.name in (docker_binaries)
@@ -3332,10 +3346,22 @@
 - macro: known_ptrace_procs
   condition: (proc.name in (known_ptrace_binaries))
 
+- macro: ptrace_attach_or_injection
+  condition: >
+    evt.type=ptrace and evt.dir=> and
+    (evt.arg.request contains PTRACE_POKETEXT or
+    evt.arg.request contains PTRACE_POKEDATA or
+    evt.arg.request contains PTRACE_ATTACH or
+    evt.arg.request contains PTRACE_SEIZE or
+    evt.arg.request contains PTRACE_SETREGS)
+
 - rule: PTRACE attached to process
   desc: "This rule detects an attempt to inject code into a process using PTRACE."
-  condition: evt.type=ptrace and evt.dir=> and evt.arg.request in (5, 6, 11, 20, 27) and proc_name_exists and not known_ptrace_procs
-  output: Detected ptrace PTRACE_ATTACH attempt (proc.cmdline=%proc.cmdline container=%container.info evt.type=%evt.type evt.arg.request=%evt.arg.request proc.pid=%proc.pid proc.cwd=%proc.cwd proc.ppid=%proc.ppid proc.pcmdline=%proc.pcmdline proc.sid=%proc.sid proc.exepath=%proc.exepath user.uid=%user.uid user.loginuid=%user.loginuid user.loginname=%user.loginname user.name=%user.name group.gid=%group.gid group.name=%group.name container.id=%container.id container.name=%container.name image=%container.image.repository)
+  condition: ptrace_attach_or_injection and proc_name_exists and not known_ptrace_procs
+  output: > 
+    Detected ptrace PTRACE_ATTACH attempt (proc.cmdline=%proc.cmdline container=%container.info evt.type=%evt.type evt.arg.request=%evt.arg.request proc.pid=%proc.pid proc.cwd=%proc.cwd proc.ppid=%proc.ppid
+    proc.pcmdline=%proc.pcmdline proc.sid=%proc.sid proc.exepath=%proc.exepath user.uid=%user.uid user.loginuid=%user.loginuid user.loginname=%user.loginname user.name=%user.name group.gid=%group.gid
+    group.name=%group.name container.id=%container.id container.name=%container.name image=%container.image.repository)
   priority: WARNING
   tags: [host, container, process, mitre_execution, mitre_privilege_escalation, T1055.008]
   
